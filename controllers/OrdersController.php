@@ -1,0 +1,765 @@
+<?php
+class OrdersController extends BaseController {
+    public function print($id) {
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        // Obtener detalles completos del pedido
+        $orderDetails = $this->orderModel->getOrdersWithDetails(['id' => $id]);
+        $orderItems = $this->orderModel->getOrderItems($id);
+        // Formatear los items para la vista de cocina
+        $items = [];
+        foreach ($orderItems as $item) {
+            $dish = $this->dishModel->find($item['dish_id']);
+            $items[] = [
+                'dish_name' => $dish ? $dish['name'] : 'Platillo',
+                'quantity' => $item['quantity'],
+                'notes' => $item['notes'] ?? ''
+            ];
+        }
+        $orderDetails = $orderDetails[0] ?? $order;
+        $orderDetails['items'] = $items;
+        $this->view('orders/print', [
+            'order' => $orderDetails
+        ]);
+    }
+    private $orderModel;
+    private $tableModel;
+    private $dishModel;
+    private $waiterModel;
+    private $customerModel;
+    
+    public function __construct() {
+        parent::__construct();
+        $this->requireAuth();
+        $this->orderModel = new Order();
+        $this->tableModel = new Table();
+        $this->dishModel = new Dish();
+        $this->waiterModel = new Waiter();
+        $this->customerModel = new Customer();
+    }
+    
+    public function index() {
+        $user = $this->getCurrentUser();
+        $filters = [];
+        
+        // Check if we're showing future orders
+        $showFuture = isset($_GET['future']) && $_GET['future'] == '1';
+        
+        // Filter by waiter for non-admin users
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if ($waiter) {
+                $filters['waiter_id'] = $waiter['id'];
+            } else {
+                // User is not a waiter, show empty list
+                $orders = [];
+            }
+        }
+        
+        // Add search filter
+        if (isset($_GET['search']) && !empty($_GET['search'])) {
+            $filters['search'] = $_GET['search'];
+        }
+        
+        if (!isset($orders)) {
+            if ($showFuture) {
+                $orders = $this->orderModel->getFuturePickupOrders($filters);
+            } else {
+                $orders = $this->orderModel->getTodaysOrders($filters);
+            }
+        }
+        
+        $this->view('orders/index', [
+            'orders' => $orders,
+            'user' => $user,
+            'showFuture' => $showFuture
+        ]);
+    }
+    
+    public function create() {
+        $user = $this->getCurrentUser();
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $this->processCreate();
+        } else {
+            // Get appropriate tables based on user role and locking rules
+            if ($user['role'] === ROLE_WAITER) {
+                $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+                $tables = $waiter ? $this->tableModel->getAvailableTablesForWaiter($waiter['id']) : [];
+            } else {
+                // Admin and cashier can see all tables with status info
+                $tables = $this->tableModel->getTablesWithStatusInfo();
+            }
+            
+            $dishes = $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC');
+            
+            // Get waiters for admin and cashier roles
+            $waiters = [];
+            if ($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) {
+                $waiters = $this->waiterModel->getWaitersWithUsers();
+            }
+            
+            $this->view('orders/create', [
+                'tables' => $tables,
+                'dishes' => $dishes,
+                'waiters' => $waiters,
+                'user' => $user
+            ]);
+        }
+    }
+    
+    public function show($id) {
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        
+        // Check permissions
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if (!$waiter || $order['waiter_id'] != $waiter['id']) {
+                $this->redirect('orders', 'error', 'No tienes permisos para ver este pedido');
+                return;
+            }
+        }
+        
+        $orderDetails = $this->orderModel->getOrdersWithDetails(['id' => $id]);
+        $orderItems = $this->orderModel->getOrderItems($id);
+        
+        $this->view('orders/view', [
+            'order' => $orderDetails[0] ?? $order,
+            'items' => $orderItems
+        ]);
+    }
+    
+    public function edit($id) {
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        
+        // Check permissions - only waiters have restrictions, admins and cashiers can edit any order
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if (!$waiter || $order['waiter_id'] != $waiter['id']) {
+                $this->redirect('orders', 'error', 'No tienes permisos para editar este pedido');
+                return;
+            }
+        }
+        // Admin and cashier can edit any order
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $this->processEdit($id);
+        } else {
+            $orderItems = $this->orderModel->getOrderItems($id);
+            $dishes = $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC');
+            $tables = $this->tableModel->findAll(['active' => 1], 'number ASC');
+            
+            $this->view('orders/edit', [
+                'order' => $order,
+                'items' => $orderItems,
+                'dishes' => $dishes,
+                'tables' => $tables
+            ]);
+        }
+    }
+    
+    public function delete($id) {
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        
+        // Only admins can delete orders
+        if ($user['role'] !== ROLE_ADMIN) {
+            $this->redirect('orders', 'error', 'No tienes permisos para eliminar pedidos');
+            return;
+        }
+        
+        try {
+            $this->orderModel->delete($id);
+            $this->redirect('orders', 'success', 'Pedido eliminado correctamente');
+        } catch (Exception $e) {
+            $this->redirect('orders', 'error', 'Error al eliminar el pedido: ' . $e->getMessage());
+        }
+    }
+    
+    public function updateStatus($id) {
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $status = $_POST['status'] ?? '';
+            $validStatuses = [ORDER_PENDING_CONFIRMATION, ORDER_PENDING, ORDER_PREPARING, ORDER_READY, ORDER_DELIVERED];
+            
+            if (!in_array($status, $validStatuses)) {
+                $this->redirect('orders', 'error', 'Estado inválido');
+                return;
+            }
+            
+            try {
+                $this->orderModel->updateOrderStatusAndCustomerStats($id, $status);
+                $this->redirect('orders/show/' . $id, 'success', 'Estado del pedido actualizado');
+            } catch (Exception $e) {
+                $this->redirect('orders/show/' . $id, 'error', 'Error al actualizar el estado: ' . $e->getMessage());
+            }
+        } else {
+            $this->redirect('orders/show/' . $id);
+        }
+    }
+    
+    public function confirmPublicOrder($id) {
+        $this->requireRole([ROLE_ADMIN, ROLE_CASHIER]);
+        
+        $order = $this->orderModel->find($id);
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        if ($order['status'] !== ORDER_PENDING_CONFIRMATION) {
+            $this->redirect('orders', 'error', 'Solo se pueden confirmar pedidos pendientes de confirmación');
+            return;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $waiterId = $_POST['waiter_id'] ?? null;
+            
+            if (empty($waiterId)) {
+                $this->redirect('orders', 'error', 'Debe seleccionar un mesero para confirmar el pedido');
+                return;
+            }
+            
+            try {
+                $this->orderModel->update($id, [
+                    'waiter_id' => $waiterId,
+                    'status' => ORDER_PENDING
+                ]);
+                
+                $this->redirect('orders', 'success', 'Pedido público confirmado y asignado correctamente');
+            } catch (Exception $e) {
+                $this->redirect('orders', 'error', 'Error al confirmar el pedido: ' . $e->getMessage());
+            }
+        } else {
+            $waiters = $this->waiterModel->getWaitersWithUsers();
+            
+            $this->view('orders/confirm_public', [
+                'order' => $order,
+                'waiters' => $waiters
+            ]);
+        }
+    }
+    
+    public function table($tableId = null) {
+        if (!$tableId) {
+            $this->redirect('orders', 'error', 'ID de mesa requerido');
+            return;
+        }
+        
+        $table = $this->tableModel->find($tableId);
+        if (!$table) {
+            $this->redirect('orders', 'error', 'Mesa no encontrada');
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        
+        // Check permissions for waiters
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if (!$waiter || $table['waiter_id'] != $waiter['id']) {
+                $this->redirect('orders', 'error', 'No tienes permisos para ver los pedidos de esta mesa');
+                return;
+            }
+        }
+        
+        $orders = $this->orderModel->getOrdersWithDetails(['table_id' => $tableId]);
+        
+        $this->view('orders/table', [
+            'table' => $table,
+            'orders' => $orders
+        ]);
+    }
+    
+    public function futureOrders() {
+        $user = $this->getCurrentUser();
+        $filters = [];
+        
+        // Filter by waiter for non-admin users
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if ($waiter) {
+                $filters['waiter_id'] = $waiter['id'];
+            } else {
+                // User is not a waiter, show empty list
+                $orders = [];
+            }
+        }
+        
+        if (!isset($orders)) {
+            $orders = $this->orderModel->getFuturePickupOrders($filters);
+        }
+        
+        $this->view('orders/future', [
+            'orders' => $orders,
+            'user' => $user
+        ]);
+    }
+    
+    private function processCreate() {
+        $errors = $this->validateOrderInput($_POST);
+        
+        if (!empty($errors)) {
+            $user = $this->getCurrentUser();
+            $waiters = [];
+            if ($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) {
+                $waiters = $this->waiterModel->getWaitersWithUsers();
+            }
+            
+            $this->view('orders/create', [
+                'errors' => $errors,
+                'old' => $_POST,
+                'tables' => $this->tableModel->findAll(['active' => 1], 'number ASC'),
+                'dishes' => $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC'),
+                'waiters' => $waiters,
+                'user' => $user
+            ]);
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        $waiterId = null;
+        
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            $waiterId = $waiter['id'];
+        } else {
+            $waiterId = $_POST['waiter_id'];
+        }
+        
+        $orderData = [
+            'table_id' => $_POST['table_id'],
+            'waiter_id' => $waiterId,
+            'status' => ORDER_PENDING,
+            'notes' => $_POST['notes'] ?? null
+        ];
+        
+        // Handle customer assignment
+        $customerId = null;
+        if (!empty($_POST['customer_id'])) {
+            // Existing customer selected
+            $customerId = $_POST['customer_id'];
+        } elseif (!empty($_POST['new_customer_name']) && !empty($_POST['new_customer_phone'])) {
+            // Create new customer
+            try {
+                $customerData = [
+                    'name' => trim($_POST['new_customer_name']),
+                    'phone' => trim($_POST['new_customer_phone'])
+                ];
+                
+                // Validate customer data before creation
+                if (empty($customerData['name']) || empty($customerData['phone'])) {
+                    throw new Exception('Nombre y teléfono del cliente son requeridos');
+                }
+                
+                $customerId = $this->customerModel->findOrCreateByPhone($customerData);
+                
+                if (!$customerId) {
+                    throw new Exception('No se pudo crear o encontrar el cliente en la base de datos');
+                }
+                
+            } catch (Exception $e) {
+                // Show error to user instead of silently failing
+                $user = $this->getCurrentUser();
+                $waiters = [];
+                if ($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) {
+                    $waiters = $this->waiterModel->getWaitersWithUsers();
+                }
+                
+                $this->view('orders/create', [
+                    'error' => 'Error al registrar cliente: ' . $e->getMessage(),
+                    'old' => $_POST,
+                    'tables' => $this->tableModel->findAll(['active' => 1], 'number ASC'),
+                    'dishes' => $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC'),
+                    'waiters' => $waiters,
+                    'user' => $user
+                ]);
+                return;
+            }
+        }
+        
+        if ($customerId) {
+            $orderData['customer_id'] = $customerId;
+        }
+        
+        $items = [];
+        if (isset($_POST['items']) && is_array($_POST['items'])) {
+            foreach ($_POST['items'] as $item) {
+                if ($item['quantity'] > 0) {
+                    $dish = $this->dishModel->find($item['dish_id']);
+                    if ($dish) {
+                        $items[] = [
+                            'dish_id' => $item['dish_id'],
+                            'quantity' => $item['quantity'],
+                            'unit_price' => $dish['price'],
+                            'notes' => $item['notes'] ?? null
+                        ];
+                    }
+                }
+            }
+        }
+        
+        if (empty($items)) {
+            $user = $this->getCurrentUser();
+            $waiters = [];
+            if ($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) {
+                $waiters = $this->waiterModel->getWaitersWithUsers();
+            }
+            
+            $this->view('orders/create', [
+                'errors' => ['items' => 'Debe agregar al menos un platillo al pedido'],
+                'old' => $_POST,
+                'tables' => $this->tableModel->findAll(['active' => 1], 'number ASC'),
+                'dishes' => $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC'),
+                'waiters' => $waiters,
+                'user' => $user
+            ]);
+            return;
+        }
+        
+        try {
+            // Validate table assignment and waiter permissions before creating order
+            $this->validateTableAssignment($_POST['table_id'], $waiterId);
+            
+            $orderId = $this->orderModel->createOrderWithItems($orderData, $items);
+            
+            // Update table status to occupied and assign waiter
+            $this->tableModel->update($_POST['table_id'], [
+                'status' => TABLE_OCCUPIED,
+                'waiter_id' => $waiterId
+            ]);
+            
+            $this->redirect('orders/show/' . $orderId, 'success', 'Pedido creado correctamente');
+        } catch (Exception $e) {
+            $user = $this->getCurrentUser();
+            $waiters = [];
+            if ($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) {
+                $waiters = $this->waiterModel->getWaitersWithUsers();
+            }
+            
+            $this->view('orders/create', [
+                'error' => 'Error al crear el pedido: ' . $e->getMessage(),
+                'old' => $_POST,
+                'tables' => $this->tableModel->findAll(['active' => 1], 'number ASC'),
+                'dishes' => $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC'),
+                'waiters' => $waiters,
+                'user' => $user
+            ]);
+        }
+    }
+    
+    private function processEdit($id) {
+        $errors = $this->validateOrderInput($_POST, $id);
+        
+        if (!empty($errors)) {
+            $order = $this->orderModel->find($id);
+            $orderItems = $this->orderModel->getOrderItems($id);
+            $dishes = $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC');
+            $tables = $this->tableModel->findAll(['active' => 1], 'number ASC');
+            
+            $this->view('orders/edit', [
+                'errors' => $errors,
+                'order' => $order,
+                'items' => $orderItems,
+                'dishes' => $dishes,
+                'tables' => $tables,
+                'old' => $_POST
+            ]);
+            return;
+        }
+        
+        try {
+            // Prepare order data for update
+            $orderData = [
+                'notes' => $_POST['notes'] ?? null
+            ];
+            
+            // Only update table_id if provided and valid
+            if (isset($_POST['table_id']) && !empty($_POST['table_id'])) {
+                $orderData['table_id'] = $_POST['table_id'];
+            }
+            
+            $this->orderModel->update($id, $orderData);
+            
+            // Process new items if any
+            if (isset($_POST['new_items']) && is_array($_POST['new_items'])) {
+                foreach ($_POST['new_items'] as $item) {
+                    if (isset($item['dish_id']) && isset($item['quantity']) && $item['quantity'] > 0) {
+                        $dish = $this->dishModel->find($item['dish_id']);
+                        if ($dish) {
+                            $this->orderModel->addItemToOrder(
+                                $id,
+                                $item['dish_id'],
+                                $item['quantity'],
+                                $dish['price'],
+                                $item['notes'] ?? null
+                            );
+                        }
+                    }
+                }
+                
+                // Ensure order total is updated after adding new items
+                $this->orderModel->updateOrderTotal($id);
+            }
+            
+            // Update table status if table was changed
+            if (isset($_POST['table_id']) && !empty($_POST['table_id'])) {
+                $order = $this->orderModel->find($id);
+                // If the table changed, update the table status
+                if ($order['table_id'] != $_POST['table_id']) {
+                    // Set new table as occupied
+                    $this->tableModel->updateTableStatus($_POST['table_id'], TABLE_OCCUPIED);
+                    
+                    // If old table exists and no other active orders, free it
+                    if ($order['table_id']) {
+                        $activeOrders = $this->orderModel->findAll([
+                            'table_id' => $order['table_id'],
+                            'status' => [ORDER_PENDING, ORDER_PREPARING, ORDER_READY]
+                        ]);
+                        if (count($activeOrders) <= 1) { // Only current order
+                            $this->tableModel->updateTableStatus($order['table_id'], TABLE_AVAILABLE);
+                        }
+                    }
+                }
+            }
+            
+            $this->redirect('orders/show/' . $id, 'success', 'Pedido actualizado correctamente');
+        } catch (Exception $e) {
+            $order = $this->orderModel->find($id);
+            $orderItems = $this->orderModel->getOrderItems($id);
+            $dishes = $this->dishModel->findAll(['active' => 1], 'category ASC, name ASC');
+            $tables = $this->tableModel->findAll(['active' => 1], 'number ASC');
+            
+            $this->view('orders/edit', [
+                'error' => 'Error al actualizar el pedido: ' . $e->getMessage(),
+                'order' => $order,
+                'items' => $orderItems,
+                'dishes' => $dishes,
+                'tables' => $tables,
+                'old' => $_POST
+            ]);
+        }
+    }
+    
+    private function validateOrderInput($data, $excludeId = null) {
+        $errors = [];
+        
+        // Only require table_id for internal orders or pickup orders
+        // For public orders (non-pickup), table assignment is optional
+        $isPublicOrder = isset($data['is_public_order']) && $data['is_public_order'];
+        $isPickup = isset($data['is_pickup']) && $data['is_pickup'];
+        
+        // If we're editing an existing order, check if it's a public order
+        if ($excludeId) {
+            $order = $this->orderModel->find($excludeId);
+            if ($order) {
+                $isPublicOrder = !empty($order['customer_name']) || !empty($order['customer_phone']);
+                $isPickup = $order['is_pickup'] ?? false;
+            }
+        }
+        
+        // Table is required for internal orders and pickup orders
+        if (!$isPublicOrder || $isPickup) {
+            $errors = $this->validateInput($data, [
+                'table_id' => ['required' => true]
+            ]);
+        }
+        
+        // Validate waiter for admin and cashier users
+        $user = $this->getCurrentUser();
+        if (($user['role'] === ROLE_ADMIN || $user['role'] === ROLE_CASHIER) && empty($data['waiter_id'])) {
+            $errors['waiter_id'] = 'Debe seleccionar un mesero';
+        }
+        
+        return $errors;
+    }
+    
+    public function removeItem($itemId) {
+        $orderItemModel = new OrderItem();
+        $item = $orderItemModel->find($itemId);
+        
+        if (!$item) {
+            $this->redirect('orders', 'error', 'Item no encontrado');
+            return;
+        }
+        
+        $orderId = $item['order_id'];
+        $order = $this->orderModel->find($orderId);
+        
+        if (!$order) {
+            $this->redirect('orders', 'error', 'Pedido no encontrado');
+            return;
+        }
+        
+        $user = $this->getCurrentUser();
+        
+        // Check permissions - only waiters have restrictions, admins and cashiers can edit any order
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if (!$waiter || $order['waiter_id'] != $waiter['id']) {
+                $this->redirect('orders', 'error', 'No tienes permisos para editar este pedido');
+                return;
+            }
+        }
+        
+        try {
+            $this->orderModel->removeItemFromOrder($itemId);
+            $this->redirect('orders/edit/' . $orderId, 'success', 'Item eliminado correctamente');
+        } catch (Exception $e) {
+            $this->redirect('orders/edit/' . $orderId, 'error', 'Error al eliminar el item: ' . $e->getMessage());
+        }
+    }
+    
+    public function searchCustomers() {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            http_response_code(405);
+            echo json_encode(['error' => 'Method not allowed']);
+            return;
+        }
+        
+        $data = json_decode(file_get_contents('php://input'), true);
+        $query = $data['query'] ?? '';
+        
+        if (empty($query) || strlen($query) < 2) {
+            echo json_encode(['customers' => []]);
+            return;
+        }
+        
+        try {
+            $customers = $this->customerModel->searchCustomers($query);
+            header('Content-Type: application/json');
+            echo json_encode(['customers' => $customers]);
+        } catch (Exception $e) {
+            http_response_code(500);
+            echo json_encode(['error' => 'Error searching customers: ' . $e->getMessage()]);
+        }
+    }
+    
+    // ============= EXPIRED ORDERS MANAGEMENT =============
+    
+    public function expiredOrders() {
+        $user = $this->getCurrentUser();
+        $filters = [];
+        
+        // Filter by waiter for waiter users only
+        if ($user['role'] === ROLE_WAITER) {
+            $waiter = $this->waiterModel->findBy('user_id', $user['id']);
+            if ($waiter) {
+                $filters['waiter_id'] = $waiter['id'];
+            } else {
+                // User is not a waiter, show empty list
+                $orders = [];
+            }
+        }
+        // Admin and cashier can see all expired orders
+        
+        if (!isset($orders)) {
+            $orders = $this->orderModel->getExpiredOrders($filters);
+        }
+        
+        $this->view('orders/expired', [
+            'orders' => $orders,
+            'user' => $user
+        ]);
+    }
+    
+    /**
+     * Validate table assignment and waiter permissions
+     * Implements one waiter per table rule and table locking system
+     */
+    private function validateTableAssignment($tableId, $waiterId) {
+        if (!$tableId) {
+            // Allow null table (takeaway orders)
+            return;
+        }
+        
+        $table = $this->tableModel->find($tableId);
+        if (!$table) {
+            throw new Exception('Mesa no encontrada');
+        }
+        
+        // Check if table is blocked by reservations (30 minutes before reservation)
+        $this->validateTableReservationBlock($tableId);
+        
+        // If table is available, anyone can take it
+        if ($table['status'] === TABLE_AVAILABLE) {
+            return;
+        }
+        
+        // If table is occupied, only the assigned waiter can add orders
+        if ($table['status'] === TABLE_OCCUPIED && $table['waiter_id']) {
+            if ($table['waiter_id'] != $waiterId) {
+                $waiterModel = new Waiter();
+                $assignedWaiter = $waiterModel->getWaiterWithUser($table['waiter_id']);
+                $waiterName = $assignedWaiter ? $assignedWaiter['name'] : 'Otro mesero';
+                
+                throw new Exception(
+                    "Esta mesa ya está ocupada por {$waiterName}. " .
+                    "Solo el mesero asignado puede agregar pedidos a esta mesa."
+                );
+            }
+        }
+        
+        // Additional validations for other table statuses
+        if ($table['status'] === TABLE_BILL_REQUESTED) {
+            throw new Exception('No se pueden agregar pedidos a una mesa con cuenta solicitada');
+        }
+        
+        if ($table['status'] === TABLE_CLOSED) {
+            throw new Exception('No se pueden agregar pedidos a una mesa cerrada');
+        }
+    }
+    
+    /**
+     * Check if table is blocked by reservation within 30 minutes
+     */
+    private function validateTableReservationBlock($tableId) {
+        $reservationModel = new Reservation();
+        $now = new DateTime();
+        $bufferTime = clone $now;
+        $bufferTime->add(new DateInterval('PT30M')); // Add 30 minutes
+        
+        // Check for reservations within the next 30 minutes using the new method
+        $reservation = $reservationModel->getReservationWithinTimeBuffer($tableId, $now, $bufferTime);
+        
+        if ($reservation) {
+            $user = $this->getCurrentUser();
+            
+            // Only admin and cashier can override reservation blocks
+            if (!in_array($user['role'], [ROLE_ADMIN, ROLE_CASHIER])) {
+                $reservationTime = new DateTime($reservation['reservation_datetime']);
+                throw new Exception(
+                    'Esta mesa tiene una reservación a las ' . 
+                    $reservationTime->format('H:i') . '. ' .
+                    'Solo administradores y cajeros pueden usar mesas reservadas.'
+                );
+            }
+        }
+    }
+}
+?>
